@@ -24,8 +24,9 @@ from agent.memory_context import sanitize_context
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
-    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, RESTORED_FROM_STORE, TOOL_CALL_UID,
-    copy_identity_fields, message_uid_or_none, tool_call_uid_from_history)
+    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, NOTIFICATION_BOUNDARY_FLAG, REPAIR_BOOKKEEPING_FIELDS,
+    RESTORED_FROM_STORE, TOOL_CALL_UID, copy_identity_fields, message_uid_or_none,
+    tool_call_uid_from_history)
 from agent.transcript_repair import sync_flushed_message_markers
 
 
@@ -41,6 +42,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     "_kanban_stop_synthetic",  # kanban worker stop-guard
     "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
+    # Assistant seam between a gateway notice and a human turn. Inserted into a list whose
+    # neighbours may already be durable; flushing it would append it after those rows.
+    NOTIFICATION_BOUNDARY_FLAG,
 )
 
 _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}

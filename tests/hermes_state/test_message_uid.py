@@ -262,7 +262,7 @@ class TestPersistedMergeWitness:
     survivor's row, so a consumer that restarts after the merge still knows the composite's constituents."""
 
     def test_flushed_survivor_persists_the_absorbed_uids_and_restore_returns_them(self, db):
-        from agent.agent_runtime_helpers import _merge_consecutive_users
+        from agent.agent_runtime_helpers_user_merge import _merge_consecutive_users
 
         db.create_session("s", "cli")
         dangling = {"role": "user", "content": "first, never answered"}

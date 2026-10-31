@@ -21,7 +21,7 @@ from agent.message_sanitization import (
 )
 from agent.message_metadata import (
     TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
-from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
+from agent.prompt_builder import steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
@@ -31,7 +31,7 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
-from agent.message_metadata import MERGED_TURN_PREFIX
+from agent.agent_runtime_helpers_user_merge import _merge_consecutive_users
 from agent.turn_context import drop_stale_api_content
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
@@ -660,86 +660,6 @@ def _prune_unanswered_tool_calls(messages: list[dict]) -> tuple[list[dict], int]
     return pruned, repairs
 
 
-def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
-    """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
-    from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
-    from agent.conversation_compression_archive import MERGED_DURABLE_ROWS
-    from hermes_state import SessionDB
-
-    def _plain_text(content: Any) -> bool:
-        # never rewrite the persisted row around undecodable content
-        return isinstance(content, str) and not content.startswith(SessionDB._CONTENT_JSON_PREFIX)
-
-    repairs = 0
-    merged: list[dict] = []
-    for msg in messages:
-        prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
-        if (
-            prev is not None and prev.get("role") == "user"
-            and isinstance(msg, dict) and msg.get("role") == "user"
-            # A summary carrier followed by a new user row is a deliberate durable shape after
-            # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
-            and split_user_originated_turn(prev)[0] is None
-            # A /steer row that ended the previous run is already persisted; merging the next
-            # prompt into it would rewrite it in place and re-break replay parity.
-            and prev.get("display_kind") != STEER_DISPLAY_KIND
-            # Only merge plain-text content; leave multimodal (list or undecodable sentinel) content alone.
-            and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))
-        ):
-            prev_content, new_content = prev.get("content", ""), msg.get("content", "")
-            merged_content = (
-                (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
-            )
-            had_api_sidecar = "api_content" in prev
-            # Read before the marker is popped below. An unpersisted turn folded in ends the claim:
-            # the dict no longer stands for durable rows only.
-            if (prev.get(_DB_PERSISTED_MARKER) or prev.get(MERGED_DURABLE_ROWS)) and msg.get(_DB_PERSISTED_MARKER):
-                prev[MERGED_DURABLE_ROWS] = int(prev.get(MERGED_DURABLE_ROWS) or 1) + 1
-            else:
-                prev.pop(MERGED_DURABLE_ROWS, None)
-            prev["content"] = merged_content
-            # The clean-text persist override must replace only the absorbed turn, never the
-            # unanswered text before it; kept across replay passes (an empty turn absorbs too).
-            if prev_content:
-                prev[MERGED_TURN_PREFIX] = prev_content
-            # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
-            drop_stale_api_content(prev)
-            # A display-marker row (e.g. a model-switch marker persisted as role=user on
-            # purpose, #48338) merging with a plain user row must not bury the plain row's
-            # addressable identity: keeping the marker's display_kind hides the merged pair
-            # from every user-turn index used for rewind/submit addressing (display rows are
-            # excluded), so the plain row's durable id becomes unresolvable and the client's
-            # next prompt.submit fails closed with the input silently dropped (#94486). Keep
-            # the pair addressable instead: drop the display classification and carry the
-            # plain row's id, retiring the marker's own id onto the absorbed list. display_kind
-            # never reaches providers (stripped from every outgoing copy), so the merged
-            # turn's wire payload is unchanged. Deliberate scope: when BOTH rows carry
-            # display_kind (two consecutive model-switch markers) the pair keeps the first
-            # marker's classification and id — no plain row is swallowed there, so no
-            # addressable turn is lost.
-            if prev.get("display_kind") and not msg.get("display_kind"):
-                marker_row_id = prev.get("_row_id")
-                prev.pop("display_kind", None)
-                if msg.get("_row_id") is not None:
-                    if isinstance(marker_row_id, int) and not isinstance(marker_row_id, bool):
-                        absorbed_ids = prev.setdefault("_absorbed_row_ids", [])
-                        if marker_row_id not in absorbed_ids:
-                            absorbed_ids.append(marker_row_id)
-                    prev["_row_id"] = msg["_row_id"]
-                # display_kind is part of the persisted row; reclassifying stales it even
-                # when the merged bytes reproduce the persisted content (empty absorb).
-                prev.pop(_DB_PERSISTED_MARKER, None)
-            # Pop the persist marker only when the durable row actually changed: a merge that
-            # reproduces the persisted bytes (e.g. an empty incoming turn) keeps its stamp.
-            if merged_content != prev_content or had_api_sidecar:
-                prev.pop(_DB_PERSISTED_MARKER, None)
-            _remember_absorbed_row(prev, msg, folded=True)
-            repairs += 1
-            continue
-        merged.append(msg)
-    return merged, repairs
-
-
 _SEQUENCE_REPAIR_PASSES = (
     _merge_consecutive_assistants, _drop_stray_tool_results, _prune_unanswered_tool_calls,
     _merge_consecutive_users,
@@ -769,8 +689,10 @@ def repair_message_sequence(agent, messages: list[dict]) -> int:
     responses or 400s); this is the pre-call belt for host-fed, resumed or replayed histories.
     Passes in order: decode any sentinel-encoded multimodal rows (so an image is not merged as text);
     merge consecutive assistant turns (BEFORE orphan detection so the merged tool_call-id union is
-    known); drop stray tool results; prune unanswered tool_calls; merge consecutive user turns. A user
-    turn directly after an assistant turn is valid and left alone.
+    known); drop stray tool results; prune unanswered tool_calls; merge consecutive user turns.
+    A gateway notice is not welded to a human turn (either order): an ephemeral assistant
+    boundary keeps alternation so the person's text is not read under the notice footer.
+    A user turn directly after an assistant turn is valid and left alone.
     """
     if not messages:
         return 0

@@ -185,7 +185,7 @@ def test_persist_override_keeps_the_uid(db):
 
 
 def test_consecutive_user_merge_keeps_the_first_uid_and_records_the_absorbed_ones():
-    from agent.agent_runtime_helpers import _merge_consecutive_users
+    from agent.agent_runtime_helpers_user_merge import _merge_consecutive_users
 
     a = {"role": "user", "content": "first", "message_uid": "a" * UID_LEN}
     b = {"role": "user", "content": "second", "message_uid": "b" * UID_LEN}

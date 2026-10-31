@@ -10,6 +10,8 @@ Either order is the same bug: a notice welded onto an open human turn stamps the
 on the person's text.
 """
 
+import itertools
+
 import pytest
 
 from agent.agent_runtime_helpers import repair_message_sequence
@@ -56,7 +58,7 @@ def _assert_separated(messages: list[dict], notice: str, human: str) -> None:
     assert contents.count(human) == 1
     assert all(not (notice in c and human in c) for c in contents)
     roles = [m["role"] for m in messages]
-    assert not any(a == "user" and b == "user" for a, b in zip(roles, roles[1:]))
+    assert not any(a == "user" and b == "user" for a, b in itertools.pairwise(roles))
     notice_at = next(i for i, m in enumerate(messages) if m.get("content") == notice)
     human_at = next(i for i, m in enumerate(messages) if m.get("content") == human)
     lo, hi = sorted((notice_at, human_at))
